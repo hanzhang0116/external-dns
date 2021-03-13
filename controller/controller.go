@@ -20,6 +20,8 @@ import (
 	"context"
 	"sync"
 	"time"
+	"strings"
+	"fmt"
 
 	"github.com/prometheus/client_golang/prometheus"
 	log "github.com/sirupsen/logrus"
@@ -119,6 +121,8 @@ type Controller struct {
 	nextRunAtMux sync.Mutex
 	// DNS record types that will be considered for management
 	ManagedRecordTypes []string
+	//Needs to create PTR Records
+	RDNSEnabled bool
 }
 
 // RunOnce runs a single iteration of a reconciliation loop.
@@ -134,6 +138,10 @@ func (c *Controller) RunOnce(ctx context.Context) error {
 	ctx = context.WithValue(ctx, provider.RecordsContextKey, records)
 
 	endpoints, err := c.Source.Endpoints(ctx)
+	if c.RDNSEnabled {
+		// Transform DNS records to PTR records and append here
+		endpoints = append(endpoints, c.transformToPTREndPoints(endpoints)...)
+	}
 	if err != nil {
 		sourceErrorsTotal.Inc()
 		deprecatedSourceErrors.Inc()
@@ -202,4 +210,45 @@ func (c *Controller) Run(ctx context.Context) {
 			return
 		}
 	}
+}
+
+func (c *Controller) transformToPTREndPoints(endPoints []*endpoint.Endpoint) []*endpoint.Endpoint {
+
+	resultEndPoints := make(map[string]*endpoint.Endpoint, 0)
+
+	for _, ep := range endPoints {
+		// TODO: Add AAAA support
+		if ep.RecordType != endpoint.RecordTypeA || len(ep.Targets) < 1 {
+			log.Debug("Ignore creating a PTR record since it doesn't have a valid target ")
+			continue
+		}
+		for _, target := range ep.Targets {
+			ptr := getPTRRecord(target)
+			if p, exists := resultEndPoints[ptr]; exists {
+				p.Targets = append(p.Targets, ep.DNSName)
+				continue
+			}
+			pep := new(endpoint.Endpoint)
+			pep.RecordType = endpoint.RecordTypePTR
+			pep.RecordTTL = ep.RecordTTL
+			pep.Targets = make(endpoint.Targets, 0)
+			pep.Targets = append(pep.Targets, ep.DNSName)
+			pep.DNSName = ptr
+			resultEndPoints[ptr] = pep
+		}
+	}
+	ret := make([]*endpoint.Endpoint, 0)
+	for _, v := range resultEndPoints {
+		ret = append(ret, v)
+	}
+	return ret
+}
+func getPTRRecord(ip string) (ptr string) {
+	segments := strings.Split(ip, ".")
+	for i := len(segments)/2 - 1; i >= 0; i-- {
+		opp := len(segments) - 1 - i
+		segments[i], segments[opp] = segments[opp], segments[i]
+	}
+	ptr = fmt.Sprintf("%s.in-addr.arpa.", strings.Join(segments, "."))
+	return ptr
 }
